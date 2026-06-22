@@ -41,6 +41,8 @@ brew install ffmpeg
 
 Download the latest `.pkg` from the [GitHub Releases page](https://github.com/nafatyuk/aacmax/releases/latest), then double-click it.
 
+Current packages are unsigned and not notarized. macOS may warn before opening them; if so, install from Terminal with the command below or use the source install option.
+
 The package installs:
 
 ```text
