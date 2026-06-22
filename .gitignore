@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# editor/temp
+*.swp
+*~
+
+# aacmax runtime artifacts (should never be committed)
+*.m4a
+*.bak.*

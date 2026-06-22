@@ -1,0 +1,562 @@
+#!/usr/bin/env zsh
+#
+# ============================================================================
+#  aacmax — encode audio to highest-quality Apple AAC (VBR) .m4a
+# ============================================================================
+#
+#  WHAT IT DOES
+#    Re-encodes one or more audio files to AAC in an .m4a container, aiming for
+#    the best quality your ffmpeg build can produce (Apple's aac_at VBR first,
+#    with graceful fallbacks). Preserves metadata, chapters, and cover art when
+#    possible. Never overwrites existing files; writes atomically via a temp
+#    file; verifies the result before keeping it.
+#
+#  USAGE
+#    aacmax <file1> [file2 ...]
+#    aacmax-parallel <file1> [file2 ...]      # force the parallel scheduler
+#
+#    Tip: type 'aacmax ' then drag files into Terminal and press Return.
+#    Wildcards work too:  aacmax *.wav
+#
+#  AUTO PARALLELISM  (this is the merged behavior)
+#    * 1 file        -> runs inline, in the foreground, with live progress.
+#                       (Splitting a single audio encode across cores isn't
+#                       worth it, so we don't.)
+#    * 2+ files      -> runs several at once, scaled to min(files, cores-1),
+#                       leaving one core free so the machine stays responsive.
+#                       Per-job output goes to a temporary log directory.
+#    You just run `aacmax <files>` and it picks the right mode.
+#
+#  ENVIRONMENT KNOBS
+#    AACMAX_FORCE=1          Re-encode even if the input is already AAC
+#                            (normally such files are skipped to avoid quality
+#                            loss from re-compressing).
+#    AACMAX_JOBS=N           Use exactly N parallel workers. N=1 forces serial
+#                            (one-at-a-time) mode. Unset / "auto" => cores-1.
+#    AACMAX_FORCE_PARALLEL=1 Internal: set by `aacmax-parallel` to always use
+#                            the scheduler. You normally don't set this by hand.
+#
+#  EXIT STATUS
+#    0   all requested files succeeded (or were harmlessly skipped)
+#    1   one or more files failed
+#    64  bad usage (no files given)
+#    127 ffmpeg not installed
+#    130 / 143  interrupted (Ctrl-C / TERM) — temp files are cleaned up
+#
+#  DEPENDENCIES
+#    ffmpeg (required), ffprobe (optional but recommended — enables stream,
+#    chapter, cover-art and duration checks). Install: brew install ffmpeg
+#
+#  DESIGN NOTES / HISTORY
+#    Previously this was two separate functions (`aacmax` and a near-duplicate
+#    `aacmax-parallel`). They are now merged: the hardened per-file conversion
+#    lives once in `_aacmax_one`, and `_aacmax_main` decides serial vs parallel.
+#    The earlier inline "(FIX A/C/D)" / "(v1)/(v2)" breadcrumbs have been folded
+#    into ordinary explanatory comments at each self-healing retry below.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# _aacmax_one <file>
+#   Convert exactly ONE file. Self-contained: does its own dependency and
+#   encoder detection so it behaves identically whether called in the
+#   foreground (serial mode) or as a background subshell (parallel mode).
+#   Returns: 0 success OR harmless skip (already-AAC); 1 failure; 127 no ffmpeg.
+# ----------------------------------------------------------------------------
+_aacmax_one() {
+  emulate -L zsh
+  setopt localtraps
+  zmodload -i zsh/complist
+  set -o nounset 2>/dev/null || true
+
+  local f=${1:-}
+  if [[ -z $f ]]; then
+    print -u2 "ERROR: _aacmax_one called with no file."
+    return 1
+  fi
+
+  # ---- dependencies ----
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    print -u2 "ERROR: ffmpeg not found. Install: brew install ffmpeg"
+    return 127
+  fi
+  local has_ffprobe=0
+  command -v ffprobe >/dev/null 2>&1 && has_ffprobe=1
+
+  # ---- encoder availability ----
+  local have_aac_at=0 have_aac_native=0
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '\baac_at\b'     && have_aac_at=1
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '(^|\s)aac(\s|$)' && have_aac_native=1
+  if (( !have_aac_at && !have_aac_native )); then
+    print -u2 "ERROR: No AAC encoder found in this ffmpeg build (aac_at nor native aac). Reinstall ffmpeg."
+    return 1
+  fi
+
+  # Temp file is cleaned up if we're interrupted mid-encode.
+  local tmp=""
+  TRAPINT()  { [[ -n $tmp ]] && rm -f -- "$tmp"; return 130 }
+  TRAPTERM() { [[ -n $tmp ]] && rm -f -- "$tmp"; return 143 }
+
+  # ---- input checks ----
+  if [[ ! -e $f ]]; then print -u2 "ERROR: Not found: $f";              return 1; fi
+  if [[ ! -f $f ]]; then print -u2 "ERROR: Not a regular file: $f";     return 1; fi
+  if [[ ! -r $f ]]; then print -u2 "ERROR: No read permission: $f";     return 1; fi
+  local dir="${f:h}"
+  if [[ ! -w $dir ]]; then print -u2 "ERROR: No write permission in: $dir"; return 1; fi
+
+  local insize
+  insize=$(stat -f%z "$f" 2>/dev/null || print 0)
+  if [[ $insize -le 0 ]]; then print -u2 "ERROR: Empty or unreadable file: $f"; return 1; fi
+
+  # disk space (need input size + 50MB headroom)
+  local avail_kb need_kb
+  avail_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4+0}')
+  need_kb=$(( (insize/1024) + 51200 ))
+  if [[ -n $avail_kb && $avail_kb -lt $need_kb ]]; then
+    print -u2 "ERROR: Not enough free space in $dir (need ~${need_kb} KB, have ${avail_kb} KB)"
+    return 1
+  fi
+
+  # ensure an audio stream actually exists
+  if (( has_ffprobe )); then
+    if ! ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$f" >/dev/null 2>&1; then
+      print -u2 "ERROR: No audio stream found in: $f"
+      return 1
+    fi
+  fi
+
+  # skip already-AAC input (re-compressing lossy->lossy just loses quality).
+  # This is a harmless skip, not a failure -> return 0.
+  if (( has_ffprobe )); then
+    local in_codec
+    in_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null)
+    if [[ $in_codec == "aac" && -z ${AACMAX_FORCE-} ]]; then
+      print -u2 "SKIP: Input is already AAC. To force re-encode: AACMAX_FORCE=1 aacmax \"$f\""
+      return 0
+    fi
+  fi
+
+  # detect cover art so we can try to preserve it
+  local keep_cover=0
+  if (( has_ffprobe )); then
+    if ffprobe -v error -select_streams v -show_entries stream=disposition,codec_name \
+         -of default=nw=1:nk=1 "$f" 2>/dev/null | grep -q 'attached_pic=1'; then
+      keep_cover=1
+    fi
+  fi
+
+  # build a non-clobbering output path: name_AAC_VBR.m4a, then (1), (2), ...
+  local stem="${f:t:r}" out
+  out="$dir/${stem}_AAC_VBR.m4a"
+  local i=1
+  while [[ -e $out ]]; do
+    out="$dir/${stem}_AAC_VBR($i).m4a"; (( i++ ))
+  done
+
+  # temp output (we only move it into place once everything succeeds)
+  tmp="$(mktemp "/tmp/aacmax.$$.XXXXXX.m4a")" || { print -u2 "ERROR: Could not create temp file."; return 1; }
+
+  # channel count -> sane CBR bitrate if we have to fall back
+  local ch=2 br="256k"
+  if (( has_ffprobe )); then
+    ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null)
+    [[ -z $ch ]] && ch=2
+  fi
+  [[ $ch -lt 2 ]] && br="128k" || br="256k"
+
+  print "→ Encoding: $f"
+
+  # ---- ffmpeg option arrays ----
+  local -a base_opts map_opts vcopy_opts mux_opts
+  base_opts=(-hide_banner -nostdin -y -i "$f" -map_metadata 0)
+
+  # keep chapters only if the input actually has them
+  if (( has_ffprobe )); then
+    local _ch
+    _ch=$(ffprobe -v error -show_entries chapters=start -of csv=p=0 "$f" 2>/dev/null | head -n1)
+    if [[ -n "$_ch" ]]; then
+      base_opts+=(-map_chapters 0)     # keep chapters
+    else
+      base_opts+=(-map_chapters -1)    # no chapters to keep
+    fi
+  else
+    base_opts+=(-map_chapters 0)       # detection unavailable: preserve default
+  fi
+
+  map_opts=(-map 0:a:0)
+  vcopy_opts=()
+  if (( keep_cover )); then
+    map_opts+=(-map 0:v:0)
+    vcopy_opts=(-c:v copy -disposition:v:0 attached_pic)
+  fi
+  mux_opts=(-movflags +faststart+use_metadata_tags "$tmp")
+
+  # ---- run ffmpeg, logging stderr and self-healing common failures ----
+  local log; log="$(mktemp "/tmp/aacmax.log.$$.XXXX")"
+
+  run_ff() {  # args: encoder options
+    local -a enc_opts; enc_opts=("$@")
+    if ffmpeg "${base_opts[@]}" "${map_opts[@]}" "${vcopy_opts[@]}" "${enc_opts[@]}" "${mux_opts[@]}" 2> "$log"; then
+      return 0
+    fi
+
+    # Cover-art / stream-specifier parse error -> drop the cover art and its
+    # video map, then ask the caller to retry the same encoder once.
+    if grep -qi 'Trailing garbage at the end of a stream specifier' "$log" ||
+       grep -qi 'Error parsing options for output file' "$log"; then
+      vcopy_opts=()
+      local -a new_map; new_map=()
+      local i=1
+      while (( i <= ${#map_opts} )); do
+        if [[ ${map_opts[i]} == -map && ${map_opts[i+1]:-} == 0:v:* ]]; then
+          (( i+=2 )); continue          # skip this "-map 0:v:*" pair
+        fi
+        new_map+=("${map_opts[i]}"); (( i++ ))
+      done
+      map_opts=("${new_map[@]}")
+      return 2                          # 2 = "retry me once"
+    fi
+
+    # "too many bits per frame" -> this encoder/mode can't do it; let the
+    # attempt ladder move on to the next fallback (we just report failure here).
+    if grep -qi 'too many bits per frame' "$log"; then
+      return 3
+    fi
+
+    # Invalid data -> retry once without +faststart (some inputs choke on it).
+    if grep -qi 'Invalid data found when processing input' "$log"; then
+      [[ -n ${tmp-} ]] || return 4
+      local -a saved_mux; saved_mux=("${mux_opts[@]}")
+      mux_opts=(-movflags +use_metadata_tags "$tmp")
+      if ffmpeg "${base_opts[@]}" "${map_opts[@]}" "${vcopy_opts[@]}" "${enc_opts[@]}" "${mux_opts[@]}" 2>> "$log"; then
+        mux_opts=("${saved_mux[@]}"); return 0
+      fi
+      mux_opts=("${saved_mux[@]}")
+      return 4
+    fi
+
+    # Chapter-related failure -> drop chapters and retry once.
+    if grep -qiE 'chap(ter|ters)|could not write header.*chap|invalid argument.*chap' "$log"; then
+      local idx
+      idx=${base_opts[(I)-map_chapters]}
+      if (( idx > 0 && idx < ${#base_opts}+1 )); then
+        base_opts[$((idx+1))]=-1
+      else
+        base_opts+=(-map_chapters -1)
+      fi
+      if ffmpeg "${base_opts[@]}" "${map_opts[@]}" "${vcopy_opts[@]}" "${enc_opts[@]}" "${mux_opts[@]}" 2>> "$log"; then
+        return 0
+      fi
+    fi
+
+    return 1                            # generic failure
+  }
+
+  # try_ff: run an encoder; if run_ff asked to retry (rc 2), run it once more.
+  # NOTE: this always re-captures the retry's exit code (the previous version
+  # could leave rc stuck at 2 if the retry itself failed).
+  try_ff() {
+    local rc
+    run_ff "$@"; rc=$?
+    if (( rc == 2 )); then
+      run_ff "$@"; rc=$?
+    fi
+    return $rc
+  }
+
+  # ---- attempt ladder: best encoder first, graceful fallbacks after ----
+  local used_encoder="" ok=0 rc=0
+
+  # 1) aac_at VBR, best quality, with optional flags if this build supports them
+  if (( have_aac_at )); then
+    local -a enc1=(-c:a aac_at -q:a 0)
+    local helptext; helptext=$(ffmpeg -hide_banner -h encoder=aac_at 2>&1 || true)
+    print -r -- "$helptext" | grep -q -- '-aac_at_mode'     && enc1+=(-aac_at_mode vbr)
+    print -r -- "$helptext" | grep -q -- '-aac_at_quality ' && enc1+=(-aac_at_quality 0)
+    try_ff "${enc1[@]}"; rc=$?
+    (( rc == 0 )) && { used_encoder="aac_at(vbr-q0)"; ok=1; }
+  fi
+
+  # 2) aac_at VBR, minimal flags
+  if (( !ok && have_aac_at )); then
+    try_ff -c:a aac_at -q:a 0; rc=$?
+    (( rc == 0 )) && { used_encoder="aac_at(vbr-min)"; ok=1; }
+  fi
+
+  # 3) aac_at constrained-VBR at the chosen bitrate
+  if (( !ok && have_aac_at )); then
+    try_ff -c:a aac_at -aac_at_mode cvbr -b:a "$br"; rc=$?
+    (( rc == 0 )) && { used_encoder="aac_at(cvbr-$br)"; ok=1; }
+  fi
+
+  # 4) aac_at CBR at the chosen bitrate
+  if (( !ok && have_aac_at )); then
+    try_ff -c:a aac_at -aac_at_mode cbr -b:a "$br"; rc=$?
+    (( rc == 0 )) && { used_encoder="aac_at(cbr-$br)"; ok=1; }
+  fi
+
+  # 5) native AAC CBR — last-resort fallback
+  if (( !ok && have_aac_native )); then
+    if try_ff -c:a aac -b:a "$br"; then
+      used_encoder="aac(cbr-$br)"; ok=1
+    fi
+  fi
+
+  if (( !ok )); then
+    print -u2 "✗ Encode failed after all remedies and fallbacks. See: $log"
+    rm -f -- "$tmp"; tmp=""
+    return 1
+  fi
+  rm -f -- "$log" 2>/dev/null || true
+
+  # ---- verify output, warn if duration drifted more than 1s ----
+  if (( has_ffprobe )); then
+    local out_codec
+    out_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$tmp" 2>/dev/null)
+    if [[ $out_codec != "aac" ]]; then
+      print -u2 "✗ Verification failed (output codec '$out_codec' != 'aac'): $f"
+      rm -f -- "$tmp"; tmp=""
+      return 1
+    fi
+    local in_dur out_dur diff warn
+    in_dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f"   2>/dev/null)
+    out_dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$tmp" 2>/dev/null)
+    if [[ -n $in_dur && -n $out_dur ]]; then
+      diff=$(awk -v a="$in_dur" -v b="$out_dur" 'BEGIN{d=a-b; if(d<0)d=-d; print d}')
+      warn=$(awk -v d="$diff" 'BEGIN{print (d>1.0)?"1":"0"}')
+      [[ $warn == 1 ]] && print -u2 "WARN: Duration differs by ~${diff}s (input vs output) for: $f"
+    fi
+  fi
+
+  # ---- move temp result into final place ----
+  if ! mv -f -- "$tmp" "$out"; then
+    print -u2 "✗ Could not move output into place: $out"
+    rm -f -- "$tmp"; tmp=""
+    return 1
+  fi
+  tmp=""
+
+  # ---- success summary ----
+  if (( has_ffprobe )); then
+    local info
+    info=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,bit_rate -of default=nw=1:nk=1 "$out" 2>/dev/null || true)
+    [[ -n $info ]] && print "✓ Wrote: $out  [$info | encoder: $used_encoder]" \
+                   || print "✓ Wrote: $out  [encoder: $used_encoder]"
+  else
+    print "✓ Wrote: $out  [encoder: $used_encoder]"
+  fi
+
+  return 0
+}
+
+
+# ----------------------------------------------------------------------------
+# _aacmax_worker_count <nfiles>
+#   Decide how many parallel workers to use. Honors AACMAX_JOBS; otherwise
+#   defaults to (cores - 1). Never more workers than there are files.
+# ----------------------------------------------------------------------------
+_aacmax_worker_count() {
+  local nfiles=$1 cores njobs
+  cores=$(sysctl -n hw.ncpu 2>/dev/null || print 4)
+
+  if [[ -n ${AACMAX_JOBS-} && ${AACMAX_JOBS} != auto ]]; then
+    if [[ $AACMAX_JOBS == <-> ]]; then        # all-digits
+      njobs=$AACMAX_JOBS
+    else
+      print -u2 "WARN: AACMAX_JOBS='$AACMAX_JOBS' is not a number; using auto (cores-1)."
+      njobs=$(( cores - 1 ))
+    fi
+  else
+    njobs=$(( cores - 1 ))
+  fi
+
+  (( njobs < 1 )) && njobs=1
+  (( njobs > nfiles )) && njobs=$nfiles      # don't spin up idle workers
+  print -- $njobs
+}
+
+
+# ----------------------------------------------------------------------------
+# _aacmax_run_serial <file...>
+#   One file at a time, foreground, with live progress. Used for a single file
+#   or when AACMAX_JOBS=1.
+# ----------------------------------------------------------------------------
+_aacmax_run_serial() {
+  local failures=0 f rc
+  for f in "$@"; do
+    _aacmax_one "$f"; rc=$?
+    (( rc != 0 )) && failures=1
+  done
+  return $failures
+}
+
+
+# ----------------------------------------------------------------------------
+# _aacmax_run_parallel <max_procs> <file...>
+#   Run up to <max_procs> conversions at once. Keeps the queue full, tracks
+#   only its own child PIDs, logs each job, and on Ctrl-C/TERM kills just its
+#   own jobs and reports cleanly.
+# ----------------------------------------------------------------------------
+_aacmax_run_parallel() {
+  emulate -L zsh
+  set -o nounset
+  setopt localtraps
+
+  local max_procs=$1; shift
+  (( max_procs < 1 )) && max_procs=1
+
+  local logdir
+  logdir="$(mktemp -d "${TMPDIR:-/tmp}/aacmax-logs.$$.XXXX")" || {
+    print -u2 "ERROR: Could not create log directory."
+    return 1
+  }
+  print "Running up to ${max_procs} job(s) in parallel."
+  print "Per-job output logged to: $logdir"
+
+  local -a pids=()
+  local failures=0 cancelled=0 cancel_sig=""
+
+  _aacmax_parallel_cleanup() {
+    local sig=$1
+    print -u2 ""
+    print -u2 "!! Signal received ($sig). Killing all active jobs..."
+    cancelled=1; cancel_sig=$sig
+    (( ${#pids} )) && kill "${pids[@]}" 2>/dev/null || true
+    print -u2 "All jobs cancelled."
+    [[ $sig = INT  ]] && return 130    # 128 + 2
+    [[ $sig = TERM ]] && return 143    # 128 + 15
+    return 1
+  }
+  TRAPINT()  { _aacmax_parallel_cleanup INT }
+  TRAPTERM() { _aacmax_parallel_cleanup TERM }
+
+  start_job() {
+    local f=$1 logfile=$2
+    ( _aacmax_one "$f" ) >"$logfile" 2>&1 &
+    pids+=($!)                          # track this job
+  }
+
+  # Wait for one of OUR jobs to finish and update failure state. Ignores any
+  # unrelated background jobs in the shell.
+  wait_for_one_job() {
+    local finished_pid=0 job_rc=0
+    while true; do
+      if ! wait -n -p finished_pid; then
+        job_rc=$?
+      fi
+      local idx=0
+      idx=${pids[(I)$finished_pid]}
+      if (( idx == 0 )); then
+        (( cancelled )) && return       # bail if we're tearing down
+        continue                        # not ours: keep waiting
+      fi
+      pids=(${pids:#$finished_pid})      # remove from tracked list
+      if (( job_rc != 0 )); then
+        (( ! cancelled )) && failures=1
+      fi
+      break
+    done
+  }
+
+  local i=0 f stem logfile
+  for f in "$@"; do
+    (( cancelled )) && break
+    if [[ ! -f $f ]]; then
+      print -u2 "SKIP: Not a file: $f"
+      continue
+    fi
+    (( i++ ))
+    stem="${f:t:r}"
+    logfile="$logdir/${i}-${stem}.log"
+
+    # at capacity: wait until one of our jobs ends before starting another
+    while (( ${#pids} >= max_procs )); do
+      wait_for_one_job
+      (( cancelled )) && break
+    done
+    (( cancelled )) && break
+
+    start_job "$f" "$logfile"
+  done
+
+  if (( cancelled )); then
+    [[ $cancel_sig = TERM ]] && return 143
+    return 130
+  fi
+
+  print "All jobs started. Waiting for the last ones to finish..."
+  while (( ${#pids} > 0 )); do
+    wait_for_one_job
+    (( cancelled )) && break
+  done
+
+  if (( cancelled )); then
+    [[ $cancel_sig = TERM ]] && return 143
+    return 130
+  fi
+
+  if (( failures )); then
+    print -u2 "✗ Some jobs failed."
+    print -u2 "  Check logs in: $logdir"
+  else
+    print "✓ All jobs completed successfully."
+    rm -rf "$logdir" 2>/dev/null || true
+    print "Cleaned up log directory."
+  fi
+
+  return $failures
+}
+
+
+# ----------------------------------------------------------------------------
+# _aacmax_main <file...>
+#   Front desk: validate usage, decide serial vs parallel, dispatch.
+# ----------------------------------------------------------------------------
+_aacmax_main() {
+  emulate -L zsh
+  setopt localtraps
+
+  if (( $# == 0 )); then
+    print "Usage: aacmax <file1> [file2 ...]"
+    print "       aacmax-parallel <file1> [file2 ...]   # force parallel"
+    print ""
+    print "Tip: type 'aacmax ' then drag files into Terminal and press Return."
+    print "Env: AACMAX_FORCE=1  re-encode even if input is already AAC"
+    print "     AACMAX_JOBS=N   N parallel workers (1 = serial); default cores-1"
+    return 64
+  fi
+
+  local nfiles=$# workers
+  workers=$(_aacmax_worker_count $nfiles)
+
+  local force_parallel=0
+  [[ -n ${AACMAX_FORCE_PARALLEL-} ]] && force_parallel=1
+
+  # 1 file (or AACMAX_JOBS=1 -> workers==1) runs serial with live output,
+  # unless aacmax-parallel was explicitly used. Otherwise use the scheduler.
+  if (( workers <= 1 && ! force_parallel )); then
+    _aacmax_run_serial "$@"
+  else
+    (( workers < 1 )) && workers=1
+    _aacmax_run_parallel $workers "$@"
+  fi
+}
+
+
+# ---- public commands -------------------------------------------------------
+aacmax()          { _aacmax_main "$@" }
+aacmax-parallel() { AACMAX_FORCE_PARALLEL=1 _aacmax_main "$@" }
+
+
+# ---- script dispatch -------------------------------------------------------
+# When run as an executable (via ~/bin/aacmax or the aacmax-parallel name),
+# dispatch on the invoked filename. When SOURCED (e.g. for testing, or from an
+# rc file), do nothing here — just leave the functions defined. We detect the
+# difference with zsh_eval_context: its last element is "file" while a file is
+# being sourced/dotted, and "toplevel" when the script is executed directly.
+if [[ ${zsh_eval_context[-1]} != file ]]; then
+  case "${0:t}" in
+    aacmax-parallel) aacmax-parallel "$@" ;;
+    aacmax|*)        aacmax "$@" ;;
+  esac
+fi
