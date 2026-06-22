@@ -1,0 +1,58 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+script_dir=${0:A:h}
+repo_root=${script_dir:h}
+
+version=${1:-}
+if [[ -z "$version" ]]; then
+  tag=$(git -C "$repo_root" describe --tags --exact-match 2>/dev/null || true)
+  if [[ "$tag" == v* ]]; then
+    version=${tag#v}
+  else
+    version=0.1.0
+  fi
+fi
+
+if ! command -v pkgbuild >/dev/null 2>&1; then
+  print -u2 "ERROR: pkgbuild not found. Build packages on macOS with Xcode command-line tools installed."
+  exit 127
+fi
+
+out_dir=${AACMAX_PKG_OUT:-"$repo_root/dist"}
+pkg_path="$out_dir/aacmax-$version.pkg"
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aacmax-pkg.XXXXXX")
+
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$tmp_dir/root/usr/local/bin" "$out_dir"
+install -m 0755 "$repo_root/bin/aacmax" "$tmp_dir/root/usr/local/bin/aacmax"
+ln -s aacmax "$tmp_dir/root/usr/local/bin/aacmax-parallel"
+xattr -cr "$tmp_dir/root" 2>/dev/null || true
+find "$tmp_dir/root" -name '._*' -delete
+
+pkg_args=(
+  --root "$tmp_dir/root"
+  --identifier "com.nafatyuk.aacmax"
+  --version "$version"
+  --install-location "/"
+  --filter '(^|/)\._[^/]*$'
+  --filter '(^|/)\.DS_Store$'
+  --quiet
+)
+
+if [[ -n ${AACMAX_SIGN_IDENTITY:-} ]]; then
+  pkg_args+=(--sign "$AACMAX_SIGN_IDENTITY")
+fi
+
+rm -f "$pkg_path"
+export COPYFILE_DISABLE=1
+if ! pkgbuild "${pkg_args[@]}" "$pkg_path" 2>"$tmp_dir/pkgbuild.log"; then
+  cat "$tmp_dir/pkgbuild.log" >&2
+  exit 1
+fi
+
+print "Wrote: $pkg_path"

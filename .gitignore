@@ -8,3 +8,7 @@
 # aacmax runtime artifacts (should never be committed)
 *.m4a
 *.bak.*
+
+# package/build artifacts
+dist/
+*.pkg

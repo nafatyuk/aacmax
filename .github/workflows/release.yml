@@ -1,0 +1,30 @@
+name: Release package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  pkg:
+    name: Build macOS pkg
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build installer package
+        run: scripts/build-pkg "${GITHUB_REF_NAME#v}"
+
+      - name: Create or update GitHub release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.pkg \
+            --title "$GITHUB_REF_NAME" \
+            --notes "macOS installer package for aacmax $GITHUB_REF_NAME" \
+          || gh release upload "$GITHUB_REF_NAME" dist/*.pkg --clobber

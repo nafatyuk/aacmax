@@ -37,6 +37,39 @@ brew install ffmpeg
 
 ## Install
 
+### Option 1: Install from a package
+
+Download the latest `.pkg` from the [GitHub Releases page](https://github.com/nafatyuk/aacmax/releases/latest), then double-click it.
+
+The package installs:
+
+```text
+/usr/local/bin/aacmax
+/usr/local/bin/aacmax-parallel
+```
+
+You can also install it from Terminal:
+
+```zsh
+sudo installer -pkg ~/Downloads/aacmax-*.pkg -target /
+```
+
+Check the install:
+
+```zsh
+aacmax
+```
+
+With no files, it should print usage text and exit with code `64`.
+
+Uninstall:
+
+```zsh
+sudo rm -f /usr/local/bin/aacmax /usr/local/bin/aacmax-parallel
+```
+
+### Option 2: Install from source
+
 Clone the repository:
 
 ```zsh
@@ -82,6 +115,35 @@ aacmax
 ```
 
 With no files, it should print usage text and exit with code `64`.
+
+## Building release packages
+
+Maintainers can build a macOS installer package with:
+
+```zsh
+scripts/build-pkg 0.1.0
+```
+
+That writes:
+
+```text
+dist/aacmax-0.1.0.pkg
+```
+
+The package payload is intentionally small: it installs `bin/aacmax` as `/usr/local/bin/aacmax` and adds `/usr/local/bin/aacmax-parallel` as a symlink. It does not include FFmpeg or ffprobe.
+
+To sign the package with a Developer ID Installer certificate:
+
+```zsh
+AACMAX_SIGN_IDENTITY="Developer ID Installer: Your Name (TEAMID)" scripts/build-pkg 0.1.0
+```
+
+The repository also includes a GitHub Actions workflow that builds and attaches a `.pkg` when a version tag is pushed:
+
+```zsh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Usage
 
